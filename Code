@@ -1,0 +1,534 @@
+import argparse
+import json
+import zipfile
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Union
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    precision_recall_fscore_support,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+)
+
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
+
+COLUMNS = [
+    "age", "sex", "cp", "trestbps", "chol", "fbs", "restecg",
+    "thalach", "exang", "oldpeak", "slope", "ca", "thal", "num"
+]
+
+NUMERIC_FEATURES = ["age", "trestbps", "chol", "thalach", "oldpeak"]
+CATEGORICAL_FEATURES = [c for c in COLUMNS if c not in NUMERIC_FEATURES + ["num"]]
+
+PREFERRED_MEMBERS = (
+    "processed.cleveland.data",
+    "processed.hungarian.data",
+    "processed.switzerland.data",
+    "processed.va.data",
+)
+
+
+@dataclass(frozen=True)
+class Config:
+    data_path: str
+    target_mode: str  # "multiclass" or "binary"
+    test_size: float
+    random_state: int
+    cv_folds: int
+    outdir: str
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="UCI Heart Disease Classification (GitHub-ready)")
+    p.add_argument(
+        "--data",
+        required=True,
+        type=str,
+        help="Path to dataset file: either a ZIP (e.g., data/heart+disease.zip) or a .data file (processed.cleveland.data).",
+    )
+    p.add_argument(
+        "--target",
+        default="multiclass",
+        choices=["multiclass", "binary"],
+        help="Target definition: multiclass (0–4) or binary (0 vs >0). Default: multiclass.",
+    )
+    p.add_argument("--test-size", default=0.25, type=float, help="Test split size. Default: 0.25")
+    p.add_argument("--seed", default=42, type=int, help="Random seed for reproducibility. Default: 42")
+    p.add_argument("--cv-folds", default=5, type=int, help="Number of stratified CV folds. Default: 5")
+    p.add_argument(
+        "--outdir",
+        default="outputs",
+        type=str,
+        help="Output directory for PDF/CSV/JSON artifacts. Default: outputs/",
+    )
+    return p.parse_args()
+
+
+def load_from_zip(zip_path: Path, preferred_members: Tuple[str, ...]) -> Tuple[pd.DataFrame, str]:
+    """Load a processed.*.data file from a ZIP archive."""
+    with zipfile.ZipFile(zip_path) as zf:
+        members = zf.namelist()
+        member_used: Optional[str] = None
+
+        for name in preferred_members:
+            if name in members:
+                member_used = name
+                break
+
+        if member_used is None:
+            data_files = [m for m in members if m.endswith(".data")]
+            if not data_files:
+                raise FileNotFoundError("No *.data file found inside the ZIP archive.")
+            member_used = data_files[0]
+
+        with zf.open(member_used) as f:
+            df = pd.read_csv(f, header=None, names=COLUMNS)
+
+    df = df.replace("?", np.nan)
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df, member_used
+
+
+def load_from_data_file(data_path: Path) -> pd.DataFrame:
+    """Load a processed.*.data file directly from disk."""
+    df = pd.read_csv(data_path, header=None, names=COLUMNS)
+    df = df.replace("?", np.nan)
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def load_dataset(data_path: Path) -> Tuple[pd.DataFrame, str]:
+    """
+    Load dataset from either:
+    - .zip (contains processed.*.data)
+    - .data file directly
+    Returns (df, source_description).
+    """
+    if not data_path.exists():
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+
+    if data_path.suffix.lower() == ".zip":
+        df, member_used = load_from_zip(data_path, PREFERRED_MEMBERS)
+        source = f"{data_path} (member: {member_used})"
+        return df, source
+
+    if data_path.suffix.lower() == ".data":
+        df = load_from_data_file(data_path)
+        source = str(data_path)
+        return df, source
+
+    raise ValueError("Unsupported file type. Provide a .zip or a .data file.")
+
+
+def build_target(df: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame, pd.Series]:
+    """Create X/y given the chosen target definition."""
+    if "num" not in df.columns:
+        raise ValueError("Expected 'num' column as target.")
+
+    y_raw = df["num"]
+    mask = y_raw.notna()
+    df2 = df.loc[mask].copy()
+    y_raw = y_raw.loc[mask]
+
+    if mode == "multiclass":
+        y = y_raw.astype(int)
+    elif mode == "binary":
+        y = (y_raw > 0).astype(int)
+    else:
+        raise ValueError("target_mode must be 'multiclass' or 'binary'.")
+
+    X = df2.drop(columns=["num"])
+    return X, y
+
+
+def make_preprocess() -> ColumnTransformer:
+    """Reusable preprocessing pipeline."""
+    num_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+    cat_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+    return ColumnTransformer([
+        ("num", num_pipe, NUMERIC_FEATURES),
+        ("cat", cat_pipe, CATEGORICAL_FEATURES),
+    ])
+
+
+def get_feature_names(preprocess: ColumnTransformer) -> np.ndarray:
+    """Expanded feature names after one-hot encoding."""
+    ohe = preprocess.named_transformers_["cat"].named_steps["onehot"]
+    cat_names = ohe.get_feature_names_out(CATEGORICAL_FEATURES)
+    return np.concatenate([np.array(NUMERIC_FEATURES), cat_names])
+
+
+def model_candidates(seed: int) -> Dict[str, Pipeline]:
+    """Experimentation: multiple models / parameter variants."""
+    preprocess = make_preprocess()
+    return {
+        "DecisionTree_depth4": Pipeline([
+            ("preprocess", preprocess),
+            ("clf", DecisionTreeClassifier(max_depth=4, min_samples_leaf=5, class_weight="balanced", random_state=seed)),
+        ]),
+        "DecisionTree_depth6": Pipeline([
+            ("preprocess", preprocess),
+            ("clf", DecisionTreeClassifier(max_depth=6, min_samples_leaf=5, class_weight="balanced", random_state=seed)),
+        ]),
+        "RandomForest_300": Pipeline([
+            ("preprocess", preprocess),
+            ("clf", RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=seed, n_jobs=-1)),
+        ]),
+        "GradientBoosting": Pipeline([
+            ("preprocess", preprocess),
+            ("clf", GradientBoostingClassifier(random_state=seed)),
+        ]),
+        "LogReg": Pipeline([
+            ("preprocess", preprocess),
+            ("clf", LogisticRegression(max_iter=2000, solver="lbfgs", multi_class="auto")),
+        ]),
+    }
+
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "macro_f1": f1_score(y_true, y_pred, average="macro"),
+        "weighted_f1": f1_score(y_true, y_pred, average="weighted"),
+    }
+
+
+def cross_validate_model(model: Pipeline, X: pd.DataFrame, y: pd.Series, folds: int, seed: int) -> Dict[str, float]:
+    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+    scoring = {"acc": "accuracy", "bacc": "balanced_accuracy", "macro_f1": "f1_macro", "weighted_f1": "f1_weighted"}
+    out = cross_validate(model, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+    return {
+        "cv_accuracy_mean": float(np.mean(out["test_acc"])),
+        "cv_accuracy_std": float(np.std(out["test_acc"])),
+        "cv_balanced_accuracy_mean": float(np.mean(out["test_bacc"])),
+        "cv_macro_f1_mean": float(np.mean(out["test_macro_f1"])),
+        "cv_weighted_f1_mean": float(np.mean(out["test_weighted_f1"])),
+    }
+
+
+def most_confused_pairs(cm: np.ndarray, labels: List[int], top_k: int = 5) -> List[Tuple[int, int, int]]:
+    pairs = []
+    for i, t in enumerate(labels):
+        for j, p in enumerate(labels):
+            if i == j:
+                continue
+            pairs.append((t, p, int(cm[i, j])))
+    pairs.sort(key=lambda x: x[2], reverse=True)
+    return [p for p in pairs if p[2] > 0][:top_k]
+
+
+def group_check_by_sex(y_true: np.ndarray, y_pred: np.ndarray, sex: pd.Series) -> pd.DataFrame:
+    rows = []
+    for g in sorted(sex.dropna().unique()):
+        idx = (sex == g).values
+        if idx.sum() < 5:
+            continue
+        acc = accuracy_score(y_true[idx], y_pred[idx])
+        pr, rc, f1, _ = precision_recall_fscore_support(y_true[idx], y_pred[idx], average="macro", zero_division=0)
+        rows.append({"sex": int(g), "n": int(idx.sum()), "accuracy": acc, "macro_recall": rc, "macro_f1": f1})
+    return pd.DataFrame(rows)
+
+
+def fig_text_page(title: str, lines: List[str], fontsize_title=16, fontsize_body=11):
+    fig = plt.figure(figsize=(8.27, 11.69))
+    fig.patch.set_facecolor("white")
+    plt.axis("off")
+    y = 0.95
+    plt.text(0.05, y, title, fontsize=fontsize_title, weight="bold", va="top")
+    y -= 0.05
+    for line in lines:
+        plt.text(0.05, y, line, fontsize=fontsize_body, va="top")
+        y -= 0.028
+    return fig
+
+
+def fig_table(title: str, df_table: pd.DataFrame):
+    fig = plt.figure(figsize=(8.27, 11.69))
+    plt.axis("off")
+    plt.title(title, fontsize=14, weight="bold", loc="left")
+    tbl = plt.table(cellText=df_table.values, colLabels=df_table.columns, loc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 1.3)
+    return fig
+
+
+def ensure_outdir(outdir: Path) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+
+
+def run(cfg: Config) -> None:
+    np.random.seed(cfg.random_state)
+
+    outdir = Path(cfg.outdir)
+    ensure_outdir(outdir)
+
+    df_raw, source_desc = load_dataset(Path(cfg.data_path))
+    X, y = build_target(df_raw, cfg.target_mode)
+
+    # Deterministic split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=cfg.test_size, random_state=cfg.random_state, stratify=y
+    )
+
+    # Data overview
+    missing_counts = X.isna().sum().sort_values(ascending=False)
+    class_counts = y.value_counts().sort_index()
+    class_perc = (class_counts / class_counts.sum() * 100).round(2)
+
+    # Experiments
+    candidates = model_candidates(cfg.random_state)
+    rows = []
+    fitted: Dict[str, Pipeline] = {}
+
+    for name, model in candidates.items():
+        model.fit(X_train, y_train)
+        fitted[name] = model
+
+        y_pred_test = model.predict(X_test)
+        test_metrics = compute_metrics(y_test.values, y_pred_test)
+        cv_metrics = cross_validate_model(model, X_train, y_train, cfg.cv_folds, cfg.random_state)
+
+        rows.append({"model": name, **test_metrics, **cv_metrics})
+
+    results_df = pd.DataFrame(rows).sort_values("cv_macro_f1_mean", ascending=False).reset_index(drop=True)
+    results_csv = outdir / "model_comparison_results.csv"
+    results_df.to_csv(results_csv, index=False)
+
+    # Best model
+    best_name = results_df.loc[0, "model"]
+    best_model = fitted[best_name]
+    y_pred_best = best_model.predict(X_test)
+
+    labels_sorted = sorted(np.unique(y))
+    cm = confusion_matrix(y_test, y_pred_best, labels=labels_sorted)
+    confused = most_confused_pairs(cm, labels_sorted, top_k=5)
+
+    # Error analysis
+    errors = X_test.copy()
+    errors["y_true"] = y_test.values
+    errors["y_pred"] = y_pred_best
+    misclassified = errors[errors["y_true"] != errors["y_pred"]].sort_values(["y_true", "y_pred"]).head(20)
+
+    # Ethical / subgroup diagnostic
+    fairness_df = pd.DataFrame()
+    if "sex" in X_test.columns:
+        fairness_df = group_check_by_sex(y_test.values, y_pred_best, X_test["sex"])
+
+    # Interpretation
+    preprocess = best_model.named_steps["preprocess"]
+    feature_names = get_feature_names(preprocess)
+    clf = best_model.named_steps["clf"]
+
+    feature_imp_df = None
+    interpretation_notes = []
+    if hasattr(clf, "feature_importances_"):
+        feature_imp_df = (
+            pd.DataFrame({"feature": feature_names, "importance": clf.feature_importances_})
+            .sort_values("importance", ascending=False)
+            .head(20)
+            .reset_index(drop=True)
+        )
+        interpretation_notes.append("Tree-based feature importances are shown (Top 20).")
+    elif hasattr(clf, "coef_"):
+        coef_mag = np.abs(clf.coef_).mean(axis=0)
+        feature_imp_df = (
+            pd.DataFrame({"feature": feature_names, "mean_abs_coef": coef_mag})
+            .sort_values("mean_abs_coef", ascending=False)
+            .head(20)
+            .reset_index(drop=True)
+        )
+        interpretation_notes.append("Logistic regression coefficients are summarized by mean absolute magnitude (Top 20).")
+    else:
+        interpretation_notes.append("No built-in feature importance available for this estimator.")
+
+    # Save config (reproducibility)
+    cfg_json = outdir / "run_config.json"
+    cfg_dict = asdict(cfg)
+    cfg_dict["data_source"] = source_desc
+    cfg_json.write_text(json.dumps(cfg_dict, indent=2))
+
+    # PDF report
+    pdf_path = outdir / "heart_disease_project_report.pdf"
+    with PdfPages(pdf_path) as pdf:
+        fig = fig_text_page(
+            "UCI Heart Disease — Classification Project Report",
+            [
+                "Problem: predict heart disease diagnosis from clinical measurements (UCI dataset).",
+                f"Data source: {source_desc}",
+                f"Target: {('num ∈ {0,1,2,3,4} (multiclass)' if cfg.target_mode=='multiclass' else 'binary: 1 if num>0 else 0')}",
+                "",
+                "Reproducibility:",
+                f"- random_state/seed = {cfg.random_state}",
+                f"- test_size = {cfg.test_size}, cv_folds = {cfg.cv_folds}",
+                "",
+                "Preprocessing:",
+                f"- Numeric: {NUMERIC_FEATURES} (median imputation + scaling)",
+                f"- Categorical-coded: {CATEGORICAL_FEATURES} (most-frequent imputation + one-hot)",
+            ]
+        )
+        pdf.savefig(fig); plt.close(fig)
+
+        overview = [
+            f"Samples used (after dropping missing target): {len(y)}",
+            f"Raw features: {X.shape[1]}",
+            "",
+            "Class distribution:",
+        ]
+        for k in class_counts.index:
+            overview.append(f"- Class {k}: {int(class_counts[k])} ({float(class_perc[k]):.2f}%)")
+
+        overview += ["", "Missing values per feature (top 10):"]
+        for i, (col, cnt) in enumerate(missing_counts.head(10).items(), start=1):
+            overview.append(f"{i:>2}. {col}: {int(cnt)}")
+
+        fig = fig_text_page("Data & Problem Description", overview)
+        pdf.savefig(fig); plt.close(fig)
+
+        fig = fig_table(
+            "Experimentation: Model Comparison (sorted by CV Macro F1)",
+            results_df[[
+                "model",
+                "accuracy", "balanced_accuracy", "macro_f1", "weighted_f1",
+                "cv_macro_f1_mean", "cv_balanced_accuracy_mean"
+            ]].round(4)
+        )
+        pdf.savefig(fig); plt.close(fig)
+
+        fig = fig_text_page(
+            f"Best Model: {best_name} — Test Evaluation",
+            [
+                f"Accuracy: {accuracy_score(y_test, y_pred_best):.4f}",
+                f"Balanced accuracy: {balanced_accuracy_score(y_test, y_pred_best):.4f}",
+                f"Macro F1: {f1_score(y_test, y_pred_best, average='macro'):.4f}",
+                f"Weighted F1: {f1_score(y_test, y_pred_best, average='weighted'):.4f}",
+                "",
+                "Classification report:",
+                classification_report(y_test, y_pred_best, digits=3),
+            ],
+            fontsize_body=9
+        )
+        pdf.savefig(fig); plt.close(fig)
+
+        fig = plt.figure(figsize=(8, 6))
+        ConfusionMatrixDisplay(cm, display_labels=labels_sorted).plot(values_format="d")
+        plt.title(f"Confusion Matrix — {best_name} (Test Set)")
+        plt.tight_layout()
+        pdf.savefig(fig); plt.close(fig)
+
+        # Error analysis page
+        summary_lines = [
+            "Top confusion pairs (true → predicted):",
+        ]
+        if confused:
+            for t, p, c in confused:
+                summary_lines.append(f"- {t} → {p}: {c} cases")
+        else:
+            summary_lines.append("- No off-diagonal errors (unlikely; verify split).")
+
+        summary_lines += ["", "Interpretation notes:"] + [f"- {x}" for x in interpretation_notes]
+
+        fig = fig_text_page("Error Analysis & Interpretation", summary_lines)
+        pdf.savefig(fig); plt.close(fig)
+
+        if len(misclassified) > 0:
+            fig = fig_table("Sample Misclassified Rows (first 20)", misclassified.reset_index(drop=True))
+            pdf.savefig(fig); plt.close(fig)
+
+        if feature_imp_df is not None and len(feature_imp_df) > 0:
+            top_n = min(20, len(feature_imp_df))
+            fig = plt.figure(figsize=(10, 6))
+            plt.bar(range(top_n), feature_imp_df.iloc[:top_n, 1].values)
+            plt.xticks(range(top_n), feature_imp_df.iloc[:top_n, 0].values, rotation=90)
+            plt.title(f"Top Features — {best_name}")
+            plt.tight_layout()
+            pdf.savefig(fig); plt.close(fig)
+
+        # Tree visualization if best model is DT
+        if isinstance(clf, DecisionTreeClassifier):
+            fig = plt.figure(figsize=(16, 8))
+            plot_tree(
+                clf,
+                feature_names=feature_names,
+                class_names=[str(x) for x in labels_sorted],
+                filled=True,
+                rounded=True,
+                max_depth=3
+            )
+            plt.title(f"Decision Tree Visualization (Top Levels) — {best_name}")
+            plt.tight_layout()
+            pdf.savefig(fig); plt.close(fig)
+
+        # Ethics + subgroup diagnostic
+        ethical = [
+            "Ethical considerations (brief):",
+            "- Dataset may be biased / non-representative; subgroup performance can differ.",
+            "- Educational use only; do NOT use for medical decisions.",
+            "- Subgroup diagnostic below uses 'sex' (0/1) as a basic check, not a full fairness audit.",
+        ]
+        fig = fig_text_page("Ethical Considerations", ethical)
+        pdf.savefig(fig); plt.close(fig)
+
+        if len(fairness_df) > 0:
+            fig = fig_table("Subgroup Diagnostic (by sex)", fairness_df.round(4))
+            pdf.savefig(fig); plt.close(fig)
+
+        # Bibliography
+        bib = [
+            "Bibliography (add formal citations as needed):",
+            "- UCI Machine Learning Repository: Heart Disease dataset.",
+            "- scikit-learn documentation (pipelines, preprocessing, models, metrics).",
+        ]
+        fig = fig_text_page("Bibliography", bib)
+        pdf.savefig(fig); plt.close(fig)
+
+    print("✅ Finished.")
+    print("Results CSV:", results_csv)
+    print("Report PDF:", pdf_path)
+    print("Run config JSON:", cfg_json)
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = Config(
+        data_path=args.data,
+        target_mode=args.target,
+        test_size=args.test_size,
+        random_state=args.seed,
+        cv_folds=args.cv_folds,
+        outdir=args.outdir,
+    )
+    run(cfg)
+
+
+if __name__ == "__main__":
+    main()
